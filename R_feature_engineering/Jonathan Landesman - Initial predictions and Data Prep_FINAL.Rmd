@@ -1,0 +1,281 @@
+---
+title: "Jonathan Landesman - Nike Case Study"
+output: html_document
+---
+
+# Introduction
+
+This notebook focuses on two prediction tasks:
+  - Predicting 0 for products that appear to be taken off the shelves - products that sold in 2015 but have zero 2016 sales or bookings. 
+  - "Cold starts", new products that have not been sold. 
+
+Along the way we will demonstrate h**ierarchical clustering**, a bit of **PCA** to check the results, and ultimately save the final data frame down to a CSV for actual machine learning in python.  
+
+## "Off the Shelves" or Low Hanging Fruit
+
+After studying the EDA tableau, I turned to the prediction task.  The first step is to knock off the low hanging fruit: it was clear that some products have a short shelf life, and may not sell at all in our targeted prediction period (summer 2016).  
+
+As a quick heuristic, lets predict that any product that had sales in 2015 and no sales in the first few months of 2016 (taken off the shelves) - and no bookings in spring 2016 - will likely sell nothing in the summer of 2016.   
+
+*Load in the data* 
+```{r message=FALSE, warning=FALSE, quietly=TRUE}
+rm(list=ls())
+library(readr)
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(e1071)
+library(cowplot)
+library(xgboost)
+library(lubridate)
+
+df<-read_csv('Dropbox/cs_pos_data.csv')
+scoring_list <- read_csv('Dropbox/cs_scoring_list.csv')
+bookings <- read_csv('Dropbox/cs_bookings.csv') 
+```
+*How many products in our scoring list are not in the bookings?*
+```{r}
+no_bookings <- ifelse(!(scoring_list$Style_display_code %in% bookings$Style_display_code),1,0)
+sum(no_bookings)
+```
+
+Thats a lot of products with no bookings!  Instead of predicting that all of those will be zero, lets limit it to the criterion above - sales in 2015, but no sales in 2016.  
+
+*Find products with sales in 2015 but not in 2016* 
+
+```{r}
+## Group by style display code, activity date
+off_shelves <- df %>% 
+  mutate(year = year(Activity_Date)) %>% 
+  group_by(Style_display_code, year) %>% 
+  summarize(sales = sum(NetSlsUnts_WTD)) %>%
+  arrange(year) %>% 
+  ungroup() %>% 
+  
+  #Spread across years, and filter
+  tidyr::spread(year, sales) %>%
+  replace(is.na(.), 0) %>% 
+  filter(`2015` > 0 & `2016` < 1) %>%
+  select(Style_display_code)
+```
+
+*Join to any product that had no bookings in 2016*
+```{r message=FALSE, warning=FALSE, quietly=TRUE}
+no_2016 <- bookings %>% 
+  filter(SesnYrCd == 'SU2016' | SesnYrCd == 'SP2016') %>%
+  select(Style_display_code)
+
+## Join to off_shelves
+off_shelves <- off_shelves %>% left_join(no_2016) %>% distinct()
+
+## Predict 0 if 
+scoring_list$predictions <-ifelse(scoring_list$Style_display_code %in% off_shelves$Style_display_code,0,NA)
+```
+
+##Cold Starts
+
+In our data set, we have 839 Style codes that do not appear to have any bookings - i.e. these are likely "cold starts" as discussed in the project assignment.  The rest of this notebook will focus on building up a dataset to predict these 839 targets. 
+
+```{r message=FALSE, warning=FALSE}
+
+cold_starts <- scoring_list %>% 
+  anti_join(df) %>%
+  select(Style_display_code)
+
+## Quick error check to make sure we did that right
+stopifnot(sum(cold_starts$Style_display_code %in% 
+                df$Style_display_code) == 0)
+
+cold_starts %>% nrow()
+```
+
+The overall strategy to predict cold starts is to __assume that each product's sales in the first 12 weeks (as a proxy for the season in which they are sold) is independent__.  That means that we have a dataset where we can ignore the time series component an simply model independent observations.  We also have a lot of data in our "prods_info" dataset that we can bring in as features. 
+
+The first step is to filter out our training data.  Lets find products in our dataset that have at least 12 week of sales, and their first sale occurred starting in at least Q2 2014. Why Q2 2014?  Because perhaps retailers purchase their bookings in the quarter before, and bookings are a strong predictor. 
+
+*Note: the bookings variable is vague.  Does bookings for SU2016 mean that those products were booked __for delivery to the retailer__ in SU2016?  Or would a retailer have to book in Spring 2016 for delivery later that summer?*
+
+Lets start by indexing each product's first week of sales to 1, and incrementing for each week ahead
+
+```{r, quietly = TRUE}
+weeks_of_sales <- df %>% 
+  group_by(Style_display_code, Activity_Date) %>% 
+  summarize(n=n()) %>% 
+  mutate(week_of_sales = row_number())
+
+df <- df %>% left_join(weeks_of_sales %>% select(-n)) %>% distinct()
+
+head(df)
+```
+
+Next lets find all of the "starts" in our dataset, that begin in Q2.
+
+```{r}
+starts <- df %>% group_by(Style_display_code) %>%
+  filter(week_of_sales == 1 & Activity_Date > min(df$Activity_Date)+84) %>%
+  select(Style_display_code) %>% 
+  ungroup()
+```
+
+We have three more calculations to do before we are ready to join up the dataset. First we are going to be predicting an entire season, so lets aggregate the bookings dataset by season. 
+
+```{r}
+bookings_by_season <- bookings %>% 
+  group_by(Style_display_code, SesnYrCd) %>%
+  summarize(bookings = sum(bookings))
+
+head(bookings_by_season)
+```
+
+And lets find the start and end dates of our seasons. 
+
+```{r}
+start_date_of_season <- df %>% group_by(SesnYrCd) %>%
+  summarize(start = min(Activity_Date), end = max(Activity_Date)) %>%
+  mutate(season_start = start, season_length = end-start)
+
+start_date_of_season
+```
+
+And finally lets get the first twelve weeks of sales: 
+
+```{r}
+first_quarter_sales <- df %>% 
+  filter(week_of_sales <= 12) %>%
+  group_by(Style_display_code) %>%
+  summarize(first_twelve_weeks = sum(NetSlsUnts_WTD))
+
+```
+
+Lets join everything up!
+
+```{r}
+starts <- starts %>% 
+  left_join(bookings_by_season) %>% 
+  left_join(first_quarter_sales) %>%
+  left_join(start_date_of_season)%>%
+  distinct() %>%
+  na.omit()
+```
+
+And finally, before we start adding features from the prod_info dataset to our collection, lets create the lagged bookings variable and then delete some objects to save some memory
+
+```{r}
+
+starts <- starts %>% 
+  group_by(Style_display_code) %>%  
+  mutate(date_rank = rank(start)) %>% 
+  arrange(date_rank) %>% 
+  mutate(lagged_bookings = ifelse(is.na(lag(bookings)), 0, lag(bookings))) %>% 
+  ungroup() %>% 
+  select(Style_display_code, SesnYrCd, bookings, lagged_bookings, first_twelve_weeks)
+
+rm(bookings, cold_starts, df, first_quarter_sales, start_date_of_season, weeks_of_sales)
+
+head(starts)
+```
+
+##Feature Engineering via Prod/Info (clustering + PCA)
+
+Looks great!  Now lets add in some features from prod_info.  The cell below reads in the data, transforms the data into a feature map creating dummy variable for each variable and then aggregating the data. 
+
+```{r message=FALSE, warning=FALSE}
+prod_info<-read_csv("Dropbox/cs_prod_info.csv")
+
+## Convert to Factors, exlcuding design_code, which has too many unique levels
+prod_info <- tbl_df(purrr::map(prod_info %>% select(-design_code), as.factor))
+
+## Generate dummy variables for each factor, excluding product family for memory purposes
+dummies <- dummyVars(Style_display_code ~ age_desc + 
+                       gender_desc + 
+                       color_family + 
+                       technology + 
+                       category + 
+                       product_family, data=prod_info)
+
+dummy_df<-data.frame(predict(dummies, newdata = prod_info))
+dummy_df$targets = prod_info$Style_display_code
+
+## Sum across style codes to create features - using sums not averages to keep the data categorical
+feature_map <- dummy_df %>% group_by(targets) %>% summarize_all(funs(mean))
+
+## Save some memory
+rm(dummies, dummy_df, prod_info)
+
+## Take a peak
+head(feature_map)
+```
+
+
+Now that we have a feature map, we're going to cluster based on these features to see if we can derive any insights into whether we should build separate models for each cluster. 
+
+As we have only categorical data, we are going to use hierarchical clustering.  (Centroids largely lose their meaning with categorical data.)
+
+```{r}
+feature_map <- as.data.frame(feature_map)
+row.names(feature_map)<-feature_map$targets
+targets <- feature_map$targets
+feature_map<-subset(feature_map, select = -c(targets))
+
+## Cluster
+dist_df <- dist(feature_map)
+clusters<-hclust(dist_df)
+rm(dist_df) # this is a big similarity matrix!
+
+## Look at clusters - looks like 5 Clusters
+plot(clusters)
+
+```
+
+This looks a lot like there are 5 main clusters - so we will use that.  Lets do a bit of error checking to see how that looks 
+
+```{r}
+results <- cutree(clusters, 5)
+
+## Quick check with a PCA
+pcs <- preProcess(feature_map, 
+                  method=c("BoxCox", "center", 
+                           "scale", "pca"))
+pc <- predict(pcs, feature_map)[,1:2]
+pc$clusters <- results
+
+## Sure looks like there are three clusters!  3 and 5 shoudl be combined into cluster 1
+ggplot(as.data.frame(pc), aes(x=PC1, y=PC2, color=as.factor(clusters))) + 
+  geom_point() + 
+  ggtitle('First Two Principal Components of the Feature  Set')
+```
+
+
+Looks like instead of 5 clusters, 3 might be more appropriate!  Okay we'll combine clusters 3 and 5 into cluster 1.  
+
+```{r}
+results <- ifelse(results == 3 | results == 5, 1, results)
+results <- as.data.frame(results)
+results$Style_display_code <- row.names(results)
+names(results)[1] <- "cluster"
+results$cluster<-as.factor(results$cluster)
+```
+
+Now lets join up with our original dataset and with our scoring list.
+
+```{r message=FALSE, warning=FALSE}
+feature_map$Style_display_code <- targets
+starts <- starts %>% 
+  left_join(feature_map) %>% 
+  left_join(results) %>%
+  distinct()
+
+targets_and_labels<-scoring_list %>% 
+  left_join(feature_map) %>% 
+  left_join(bookings_by_season %>% filter(SesnYrCd %in% c('SP2016','SU2016'))) %>% 
+  distinct()
+
+dim(starts)
+```
+
+Finally lets save both our dataframe and our low hanging fruit predictions down CSVs to run our Machine Learning outputs in Python. 
+
+```{r}
+data.table::fwrite(starts, file="cold_starts.csv")
+data.table::fwrite(targets_and_labels, file="predictions.csv")
+```
